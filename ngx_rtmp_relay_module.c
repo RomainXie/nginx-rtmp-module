@@ -27,6 +27,7 @@ static ngx_int_t ngx_rtmp_relay_publish(ngx_rtmp_session_t *s,
 static ngx_rtmp_relay_ctx_t * ngx_rtmp_relay_create_connection(
        ngx_rtmp_conf_ctx_t *cctx, ngx_str_t *name, ngx_str_t *args,
        ngx_rtmp_relay_target_t *target);
+static void ngx_get_np_host (ngx_str_t *args, const char *name, ngx_str_t *value);
 
 
 /*                _____
@@ -362,6 +363,8 @@ ngx_rtmp_relay_create_connection(ngx_rtmp_conf_ctx_t *cctx, ngx_str_t *name,
     ngx_str_t                       v, *uri;
     size_t                          play_path_len;
     u_char                         *first, *last, *p, *play_path, *qm;
+    u_char                         *np1, *np2;
+    ngx_url_t                      *target_url;
 
     racf = ngx_rtmp_get_module_app_conf(cctx, ngx_rtmp_relay_module);
 
@@ -384,7 +387,62 @@ ngx_rtmp_relay_create_connection(ngx_rtmp_conf_ctx_t *cctx, ngx_str_t *name,
         goto clear;
     }
 
-    if (ngx_rtmp_relay_copy_str(pool, &rctx->url, &target->url.url) != NGX_OK) {
+    if (ngx_strncmp(target->url.url.data, "NetpasTransHost", 15) == 0)
+    {
+        np1 = ngx_pcalloc(pool, NGX_RTMP_MAX_URL);
+        if (np1 == NULL)
+        {
+            goto clear;
+        }
+        rctx->np_url.url.data = np1;
+        rctx->np_url.default_port = 1935;
+        rctx->np_url.uri_part = 1;
+
+        ngx_get_np_host(args, "NetpasTransHost", &rctx->np_url.url);
+        if (rctx->np_url.url.len != 0)
+        {
+            np1 = target->url.url.data;
+            np2 = (u_char *)ngx_strchr(target->url.url.data, '/');
+            if (np2 != NULL)
+            {
+                while (np1 != np2)
+                {
+                    if (np1[0] == ':')
+                    {
+                        np2 = np1;
+                        break;
+                    }
+                    np1++;
+                }
+                ngx_sprintf(rctx->np_url.url.data + rctx->np_url.url.len, "%s", np2);
+                rctx->np_url.url.len = ngx_strlen(rctx->np_url.url.data);
+            }
+
+            if (ngx_parse_url(pool, &rctx->np_url) != NGX_OK) {
+                if (rctx->np_url.err) {
+                    ngx_log_error(NGX_LOG_ERR, racf->log, 0,
+                            "NetpasTransHost: Err %s in url \"%V\"",
+                            rctx->np_url.err, &rctx->np_url.url);
+                    ngx_memzero(rctx->np_url.url.data, sizeof(rctx->np_url.url.data));
+                    rctx->np_url.url.len = 0;
+                    goto clear;
+                }
+            }
+            target_url = &rctx->np_url;
+        }
+        else
+        {
+            ngx_log_error(NGX_LOG_ERR, racf->log, 0,
+                    "NetpasTransHost: No NetpasTransHost in args \"%V\"", args);
+            goto clear;
+        }
+    }
+    else
+    {
+        target_url = &target->url;
+    }
+
+    if (ngx_rtmp_relay_copy_str(pool, &rctx->url, &target_url->url) != NGX_OK) {
         goto clear;
     }
 
@@ -411,7 +469,7 @@ ngx_rtmp_relay_create_connection(ngx_rtmp_conf_ctx_t *cctx, ngx_str_t *name,
 
     if (rctx->app.len == 0 || rctx->play_path.len == 0) {
         /* parse uri */
-        uri = &target->url.uri;
+        uri = &target_url->uri;
         first = uri->data;
         last  = uri->data + uri->len;
         if (first != last && *first == '/') {
@@ -477,14 +535,14 @@ ngx_rtmp_relay_create_connection(ngx_rtmp_conf_ctx_t *cctx, ngx_str_t *name,
         goto clear;
     }
 
-    if (target->url.naddrs == 0) {
+    if (target_url->naddrs == 0) {
         ngx_log_error(NGX_LOG_ERR, racf->log, 0,
                       "relay: no address");
         goto clear;
     }
 
     /* get address */
-    addr = &target->url.addrs[target->counter % target->url.naddrs];
+    addr = &target_url->addrs[target->counter % target_url->naddrs];
     target->counter++;
 
     /* copy log to keep shared log unchanged */
@@ -1526,12 +1584,15 @@ ngx_rtmp_relay_push_pull(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         u->url.len  -= 7;
     }
 
-    if (ngx_parse_url(cf->pool, u) != NGX_OK) {
-        if (u->err) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                    "%s in url \"%V\"", u->err, &u->url);
+    if(ngx_strncmp(u->url.data, "NetpasTransHost", 15) != 0)
+    {
+        if (ngx_parse_url(cf->pool, u) != NGX_OK) {
+            if (u->err) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                        "%s in url \"%V\"", u->err, &u->url);
+            }
+            return NGX_CONF_ERROR;
         }
-        return NGX_CONF_ERROR;
     }
 
     value += 2;
@@ -1742,4 +1803,54 @@ ngx_rtmp_relay_postconfiguration(ngx_conf_t *cf)
     ch->handler = ngx_rtmp_relay_on_status;
 
     return NGX_OK;
+}
+
+static void
+ngx_get_np_host (ngx_str_t *args, const char *name, ngx_str_t *value)
+{
+    char *p;
+    int i = 0;
+    int name_len = 0;
+
+
+    if (args->len == 0) return;
+    if (!name) return;
+    if (value->data == NULL) return;
+
+    name_len = ngx_strlen(name);
+    p = (char *)args->data;
+    while (1) {
+        if (p[0] == '\0') return;
+
+        if (ngx_strncmp(p, name, name_len) == 0) {
+            p += name_len;
+            if (p[0] == '=') {
+                p++;
+                break;
+            } else if (ngx_strncasecmp((u_char *)p, (u_char *)"%3d", 3) == 0) {
+                p += 3;
+                break;
+            }
+        }
+
+        while (p[0] != '\0') {
+            if (p[0] == '&') {
+                p++;
+                break;
+            } else if (ngx_strncmp(p, "%26", 3) == 0) {
+                p += 3;
+                break;
+            } else
+                p++;
+        }
+    }
+    
+    for (; ; i++) {
+        if (p[i] == '%') break;
+        if (p[i] == '&') break;
+        if (p[i] == '\0') break;
+        value->data[i] = p[i];
+    }
+    value->data[i] = '\0';
+    value->len = ngx_strlen(value->data);
 }
