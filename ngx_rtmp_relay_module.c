@@ -1849,6 +1849,10 @@ ngx_get_np_host (ngx_str_t *args, const char *name, ngx_str_t *value)
         if (p[i] == '%') break;
         if (p[i] == '&') break;
         if (p[i] == '\0') break;
+
+        // fix bug
+        if (p + i > args->data + args->len) break;
+
         value->data[i] = p[i];
     }
     value->data[i] = '\0';
